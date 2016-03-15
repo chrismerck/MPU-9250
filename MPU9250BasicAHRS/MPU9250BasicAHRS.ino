@@ -27,8 +27,8 @@
  */
 #include <SPI.h>
 #include <Wire.h>   
-#include <Adafruit_GFX.h>
-#include <Adafruit_PCD8544.h>
+//#include <Adafruit_GFX.h>
+//#include <Adafruit_PCD8544.h>
 
 // Using NOKIA 5110 monochrome 84 x 48 pixel display
 // pin 9 - Serial clock out (SCLK)
@@ -36,7 +36,7 @@
 // pin 7 - Data/Command select (D/C)
 // pin 5 - LCD chip select (CS)
 // pin 6 - LCD reset (RST)
-Adafruit_PCD8544 display = Adafruit_PCD8544(9, 8, 7, 5, 6);
+//Adafruit_PCD8544 display = Adafruit_PCD8544(9, 8, 7, 5, 6);
 
 // See also MPU-9250 Register Map and Descriptions, Revision 4.0, RM-MPU-9250A-00, Rev. 1.4, 9/9/2013 for registers not listed in 
 // above document; the MPU9250 and MPU9150 are virtually identical but the latter has a different register map
@@ -268,11 +268,105 @@ float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};    // vector to hold quaternion
 float eInt[3] = {0.0f, 0.0f, 0.0f};       // vector to hold integral error for Mahony method
 
 
+ // Similar to Madgwick scheme but uses proportional and integral filtering on the error between estimated reference vectors and
+ // measured ones. 
+void MahonyQuaternionUpdate(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz)
+{
+  float q1 = q[0], q2 = q[1], q3 = q[2], q4 = q[3];   // short name local variable for readability
+  float norm;
+  float hx, hy, bx, bz;
+  float vx, vy, vz, wx, wy, wz;
+  float ex, ey, ez;
+  float pa, pb, pc;
+
+  // Auxiliary variables to avoid repeated arithmetic
+  float q1q1 = q1 * q1;
+  float q1q2 = q1 * q2;
+  float q1q3 = q1 * q3;
+  float q1q4 = q1 * q4;
+  float q2q2 = q2 * q2;
+  float q2q3 = q2 * q3;
+  float q2q4 = q2 * q4;
+  float q3q3 = q3 * q3;
+  float q3q4 = q3 * q4;
+  float q4q4 = q4 * q4;   
+
+  // Normalise accelerometer measurement
+  norm = sqrt(ax * ax + ay * ay + az * az);
+  if (norm == 0.0f) return; // handle NaN
+  norm = 1.0f / norm;        // use reciprocal for division
+  ax *= norm;
+  ay *= norm;
+  az *= norm;
+
+  // Normalise magnetometer measurement
+  norm = sqrt(mx * mx + my * my + mz * mz);
+  if (norm == 0.0f) return; // handle NaN
+  norm = 1.0f / norm;        // use reciprocal for division
+  mx *= norm;
+  my *= norm;
+  mz *= norm;
+
+  // Reference direction of Earth's magnetic field
+  hx = 2.0f * mx * (0.5f - q3q3 - q4q4) + 2.0f * my * (q2q3 - q1q4) + 2.0f * mz * (q2q4 + q1q3);
+  hy = 2.0f * mx * (q2q3 + q1q4) + 2.0f * my * (0.5f - q2q2 - q4q4) + 2.0f * mz * (q3q4 - q1q2);
+  bx = sqrt((hx * hx) + (hy * hy));
+  bz = 2.0f * mx * (q2q4 - q1q3) + 2.0f * my * (q3q4 + q1q2) + 2.0f * mz * (0.5f - q2q2 - q3q3);
+
+  // Estimated direction of gravity and magnetic field
+  vx = 2.0f * (q2q4 - q1q3);
+  vy = 2.0f * (q1q2 + q3q4);
+  vz = q1q1 - q2q2 - q3q3 + q4q4;
+  wx = 2.0f * bx * (0.5f - q3q3 - q4q4) + 2.0f * bz * (q2q4 - q1q3);
+  wy = 2.0f * bx * (q2q3 - q1q4) + 2.0f * bz * (q1q2 + q3q4);
+  wz = 2.0f * bx * (q1q3 + q2q4) + 2.0f * bz * (0.5f - q2q2 - q3q3);  
+
+  // Error is cross product between estimated direction and measured direction of gravity
+  ex = (ay * vz - az * vy) + (my * wz - mz * wy);
+  ey = (az * vx - ax * vz) + (mz * wx - mx * wz);
+  ez = (ax * vy - ay * vx) + (mx * wy - my * wx);
+  if (Ki > 0.0f)
+  {
+      eInt[0] += ex;      // accumulate integral error
+      eInt[1] += ey;
+      eInt[2] += ez;
+  }
+  else
+  {
+      eInt[0] = 0.0f;     // prevent integral wind up
+      eInt[1] = 0.0f;
+      eInt[2] = 0.0f;
+  }
+
+  // Apply feedback terms
+  gx = gx + Kp * ex + Ki * eInt[0];
+  gy = gy + Kp * ey + Ki * eInt[1];
+  gz = gz + Kp * ez + Ki * eInt[2];
+
+  // Integrate rate of change of quaternion
+  pa = q2;
+  pb = q3;
+  pc = q4;
+  q1 = q1 + (-q2 * gx - q3 * gy - q4 * gz) * (0.5f * deltat);
+  q2 = pa + (q1 * gx + pb * gz - pc * gy) * (0.5f * deltat);
+  q3 = pb + (q1 * gy - pa * gz + pc * gx) * (0.5f * deltat);
+  q4 = pc + (q1 * gz + pa * gy - pb * gx) * (0.5f * deltat);
+
+  // Normalise quaternion
+  norm = sqrt(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);
+  norm = 1.0f / norm;
+  q[0] = q1 * norm;
+  q[1] = q2 * norm;
+  q[2] = q3 * norm;
+  q[3] = q4 * norm;
+}
+
 void setup()
 {
   Wire.begin();
 //  TWBR = 12;  // 400 kbit/sec I2C speed
   Serial.begin(38400);
+  delay(2000);
   
   // Set up the interrupt pin, its set as active high, push-pull
   pinMode(intPin, INPUT);
@@ -280,11 +374,11 @@ void setup()
   pinMode(myLed, OUTPUT);
   digitalWrite(myLed, HIGH);
   
-  display.begin(); // Ini8ialize the display
-  display.setContrast(58); // Set the contrast
+  //display.begin(); // Ini8ialize the display
+  //display.setContrast(58); // Set the contrast
   
 // Start device display with ID of sensor
-  display.clearDisplay();
+  /*display.clearDisplay();
   display.setTextSize(2);
   display.setCursor(0,0); display.print("MPU9250");
   display.setTextSize(1);
@@ -300,15 +394,16 @@ void setup()
   display.clearDisplay();   // clears the screen and buffer
 
   // Read the WHO_AM_I register, this is a good test of communication
+  */
   byte c = readByte(MPU9250_ADDRESS, WHO_AM_I_MPU9250);  // Read WHO_AM_I register for MPU-9250
   Serial.print("MPU9250 "); Serial.print("I AM "); Serial.print(c, HEX); Serial.print(" I should be "); Serial.println(0x71, HEX);
-  display.setCursor(20,0); display.print("MPU9250");
+  /*display.setCursor(20,0); display.print("MPU9250");
   display.setCursor(0,10); display.print("I AM");
   display.setCursor(0,20); display.print(c, HEX);  
   display.setCursor(0,30); display.print("I Should Be");
   display.setCursor(0,40); display.print(0x71, HEX); 
   display.display();
-  delay(1000); 
+  delay(1000); */
 
   if (c == 0x71) // WHO_AM_I should always be 0x68
   {  
@@ -323,7 +418,7 @@ void setup()
     Serial.print("z-axis self test: gyration trim within : "); Serial.print(SelfTest[5],1); Serial.println("% of factory value");
  
     calibrateMPU9250(gyroBias, accelBias); // Calibrate gyro and accelerometers, load biases in bias registers
-    display.clearDisplay();
+    /*display.clearDisplay();
      
     display.setCursor(0, 0); display.print("MPU9250 bias");
     display.setCursor(0, 8); display.print(" x   y   z  ");
@@ -338,7 +433,7 @@ void setup()
     display.setCursor(48, 24); display.print(gyroBias[2], 1); 
     display.setCursor(66, 24); display.print("o/s");   
   
-    display.display();
+    display.display();*/
     delay(1000); 
   
     initMPU9250(); 
@@ -347,13 +442,13 @@ void setup()
     // Read the WHO_AM_I register of the magnetometer, this is a good test of communication
     byte d = readByte(AK8963_ADDRESS, WHO_AM_I_AK8963);  // Read WHO_AM_I register for AK8963
     Serial.print("AK8963 "); Serial.print("I AM "); Serial.print(d, HEX); Serial.print(" I should be "); Serial.println(0x48, HEX);
-    display.clearDisplay();
+    /*display.clearDisplay();
     display.setCursor(20,0); display.print("AK8963");
     display.setCursor(0,10); display.print("I AM");
     display.setCursor(0,20); display.print(d, HEX);  
     display.setCursor(0,30); display.print("I Should Be");
     display.setCursor(0,40); display.print(0x48, HEX);  
-    display.display();
+    display.display();*/
     delay(1000); 
   
     // Get magnetometer calibration from AK8963 ROM
@@ -365,20 +460,25 @@ void setup()
     Serial.print("Y-Axis sensitivity adjustment value "); Serial.println(magCalibration[1], 2);
     Serial.print("Z-Axis sensitivity adjustment value "); Serial.println(magCalibration[2], 2);
   }
-  
+
+  /*
     display.clearDisplay();
     display.setCursor(20,0); display.print("AK8963");
     display.setCursor(0,10); display.print("ASAX "); display.setCursor(50,10); display.print(magCalibration[0], 2);
     display.setCursor(0,20); display.print("ASAY "); display.setCursor(50,20); display.print(magCalibration[1], 2);
     display.setCursor(0,30); display.print("ASAZ "); display.setCursor(50,30); display.print(magCalibration[2], 2);
     display.display();
+  */
     delay(1000);  
   }
   else
   {
-    Serial.print("Could not connect to MPU9250: 0x");
-    Serial.println(c, HEX);
-    while(1) ; // Loop forever if communication doesn't happen
+    while (1) {
+      Serial.print("Could not connect to MPU9250: 0x");
+      Serial.println(c, HEX);
+      //while(1) ; // Loop forever if communication doesn't happen
+      delay(1000); 
+    }
   }
 }
 
@@ -430,7 +530,7 @@ void loop()
   // This is ok by aircraft orientation standards!  
   // Pass gyro rate as rad/s
 //  MadgwickQuaternionUpdate(ax, ay, az, gx*PI/180.0f, gy*PI/180.0f, gz*PI/180.0f,  my,  mx, mz);
-  MahonyQuaternionUpdate(ax, ay, az, gx*PI/180.0f, gy*PI/180.0f, gz*PI/180.0f, my, mx, mz);
+   MahonyQuaternionUpdate(ax, ay, az, gx*PI/180.0f, gy*PI/180.0f, gz*PI/180.0f, my, mx, mz);
 
 
     if (!AHRS) {
@@ -458,7 +558,8 @@ void loop()
    // Print temperature in degrees Centigrade      
     Serial.print("Temperature is ");  Serial.print(temperature, 1);  Serial.println(" degrees C"); // Print T values to tenths of s degree C
     }
-    
+
+    /*
     display.clearDisplay();     
     display.setCursor(0, 0); display.print("MPU9250/AK8963");
     display.setCursor(0, 8); display.print(" x   y   z  ");
@@ -481,6 +582,7 @@ void loop()
     display.setCursor(0,  40); display.print("Gyro T "); 
     display.setCursor(50,  40); display.print(temperature, 1); display.print(" C");
     display.display();
+    */
     
     count = millis();
     digitalWrite(myLed, !digitalRead(myLed));  // toggle led
@@ -536,7 +638,8 @@ void loop()
     
     Serial.print("rate = "); Serial.print((float)sumCount/sum, 2); Serial.println(" Hz");
     }
-   
+
+   /*
     display.clearDisplay();    
  
     display.setCursor(0, 0); display.print(" x   y   z  ");
@@ -560,6 +663,7 @@ void loop()
     display.setCursor(24, 32); display.print((int)(pitch)); 
     display.setCursor(48, 32); display.print((int)(roll)); 
     display.setCursor(66, 32); display.print("ypr");  
+    
   
     // With these settings the filter is updating at a ~145 Hz rate using the Madgwick scheme and 
     // >200 Hz using the Mahony scheme even though the display refreshes at only 2 Hz.
@@ -574,6 +678,7 @@ void loop()
     // The 3.3 V 8 MHz Pro Mini is doing pretty well!
     display.setCursor(0, 40); display.print("rt: "); display.print((float) sumCount / sum, 2); display.print(" Hz"); 
     display.display();
+    */
 
     count = millis(); 
     sumCount = 0;
